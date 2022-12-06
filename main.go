@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/joho/godotenv"
 
@@ -12,10 +13,25 @@ import (
 	gogpt "github.com/sashabaranov/go-gpt3"
 )
 
+var apiKey = ""
+
+var startSequence = "\nAI: "
+var restartSqeuence = "\nHuman: "
+
+// make a map to store user session
+var userSession = make(map[int64]bool)
+
+// make a map to store user's message and bot response
+var userMessages = make(map[int64]string)
+
+// create locks since userSession and userMessages are gonig to be shared by handleUpdate concurrently to avoid race
+var userSessionLock = new(sync.RWMutex)
+var userMessagesLock = new(sync.RWMutex)
+
 func main() {
 	// load env vars
 	godotenv.Load()
-	apiKey := os.Getenv("GPT3_API_KEY")
+	apiKey = os.Getenv("GPT3_API_KEY")
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 
 	// check if env vars are set
@@ -37,67 +53,75 @@ func main() {
 
 	updates := bot.GetUpdatesChan(updater)
 
-	// make a map to store user session
-	var userSession = make(map[int64]bool)
-
-	// make a map to store user's message and bot response
-	var userMessages = make(map[int64]string)
-
-	var startSequence = "\nAI: "
-	var restartSqeuence = "\nHuman: "
-
 	// loop through updates
 	for update := range updates {
-		if update.Message == nil {
-			continue
+		go handleUpdate(update, bot)
+	}
+}
+
+func handleUpdate(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
+	if update.Message == nil {
+		log.Print("[BOT] empty message")
+		return
+	}
+	// set user info
+	userId := update.Message.From.ID
+	userName := update.Message.From.UserName
+	userMessage := update.Message.Text
+	userChatID := update.Message.Chat.ID
+
+	// log user message
+	log.Printf("[BOT] From %s [id:%d]: %s", userName, userId, userMessage)
+
+	// check if user is in session
+	if update.Message.IsCommand() {
+		// handle commands
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
+		switch update.Message.Command() {
+		case "start":
+			msg.Text = "Hello " + update.Message.From.FirstName + " " + update.Message.From.LastName + ", just type /chat to start chatting with me"
+		case "chat":
+			msg.Text = "Hi, I'm a chatbot. Ask me anything!, if you want to end the chat, just type /endchat"
+			userSessionLock.Lock()
+			userSession[userId] = true
+			userSessionLock.Unlock()
+		case "endchat":
+			msg.Text = "Bye " + update.Message.From.FirstName + " " + update.Message.From.LastName + ", if you want to chat again, just type /chat"
+			userSessionLock.Lock()
+			userSession[userId] = false
+			userSessionLock.Unlock()
+
+			userMessagesLock.Lock()
+			delete(userMessages, userId)
+			userMessagesLock.Unlock()
 		}
-		// set user info
-		userId := update.Message.From.ID
-		userName := update.Message.From.UserName
-		userMessage := update.Message.Text
-		userChatID := update.Message.Chat.ID
+		bot.Send(msg)
 
-		// log user message
-		log.Printf("[BOT] From %s [id:%d]: %s", userName, userId, userMessage)
+	} else if userSession[userId] {
+		// TODO: not sure whether this check would require a read lock
 
-		// check if user is in session
-		if update.Message.IsCommand() {
-			// handle commands
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
-			switch update.Message.Command() {
-			case "start":
-				msg.Text = "Hello " + update.Message.From.FirstName + " " + update.Message.From.LastName + ", just type /chat to start chatting with me"
-			case "chat":
-				msg.Text = "Hi, I'm a chatbot. Ask me anything!, if you want to end the chat, just type /endchat"
-				userSession[userId] = true
-			case "endchat":
-				msg.Text = "Bye " + update.Message.From.FirstName + " " + update.Message.From.LastName + ", if you want to chat again, just type /chat"
-				userSession[userId] = false
-				delete(userMessages, userId)
-			}
-			bot.Send(msg)
+		// send typing action
+		sendTypingAction(bot, userChatID)
 
-		} else if userSession[userId] {
-			// send typing action
-			sendTypingAction(bot, userChatID)
+		// if user is in session, send message to GPT-3 API
+		userMessagesLock.Lock()
+		userMessages[userId] += userMessage + startSequence
+		var resp = makeCompletionRequest(apiKey, userMessages[userId])
+		userMessagesLock.Unlock()
 
-			// if user is in session, send message to GPT-3 API
-			userMessages[userId] += userMessage + startSequence
-			var resp = makeCompletionRequest(apiKey, userMessages[userId])
+		// send response to user
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, resp)
+		bot.Send(msg)
+		userMessagesLock.Lock()
+		userMessages[userId] += resp + restartSqeuence
+		userMessagesLock.Unlock()
 
-			// send response to user
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, resp)
-			bot.Send(msg)
-			userMessages[userId] += resp + restartSqeuence
-
-			// log the response
-			log.Printf("[BOT] To %s [id:%d]:: %s", update.Message.From.UserName, userId, resp)
-		} else {
-
-			// if user is not in session, send message to user
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Please type /chat to start chatting with me")
-			bot.Send(msg)
-		}
+		// log the response
+		log.Printf("[BOT] To %s [id:%d]: %s", update.Message.From.UserName, userId, resp)
+	} else {
+		// if user is not in session, send message to user
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Please type /chat to start chatting with me")
+		bot.Send(msg)
 	}
 }
 
